@@ -45,52 +45,82 @@ if __name__ == '__main__':
             'counts': counts,
         }
 
-    def deconvolve(adata, mix):
-        markerd = deconvall.get_all_markers(adata, 10)
+    def deconvolve_multiple(adata, mixes, nmark_per_ct=5):
+        # Prepare markers
+        markerd = deconvall.get_all_markers(adata, nmark_per_ct)
         marker_ser = pd.DataFrame(markerd).stack().reset_index().set_index(0)['level_1']
 
         tmp = pd.Series(np.arange(adata.shape[1]), index=adata.var_names)
         idx = tmp.loc[marker_ser.index].values
+        nmark = len(marker_ser)
 
         Xmark = adata[:, marker_ser.index].X
-        mixcountmark = mix['counts'][idx]
         nfrac = adata.shape[0]
 
-        def fun_min(fractions):
-            loss = ((Xmark.T @ fractions - mixcountmark)**2).sum()
-            return loss
+        ncall = [0]
+        def _deconv(weights, ncall=None, store_result=False):
+            if ncall is not None:
+                ncall[0] += 1
+                if (ncall[0] % 10) == 0:
+                    print(ncall[0])
+            if store_result:
+                results = []
+            ssr_total = 0
+            for mix in mixes:
+                mixcountmark = mix['counts'][idx]
+                def fun_min(fractions):
+                    loss_w_weights = (Xmark.T @ fractions - mixcountmark)
+                    # Apply weights
+                    loss_w_weights *= weights
+                    loss_w_weights /= weights.sum()
+                    loss_w_weights **= 2
+                    loss_w_weights = loss_w_weights.sum()
+                    return loss_w_weights
 
+                from scipy.optimize import minimize, LinearConstraint, Bounds
+                bounds = [[0, 1] for i in range(nfrac)]
+                c1 = LinearConstraint(np.ones(nfrac), lb=1, ub=1)
+                res = minimize(
+                    fun_min,
+                    x0=np.ones(nfrac) / nfrac,
+                    bounds=bounds,
+                    constraints=[c1],
+                )
+                residual = mix['fractions'] - res.x
+                ssr = (residual**2).sum()
+                ssr_total += ssr
+                if store_result:
+                    results.append({
+                        'fractions': mix['fractions'],
+                        'fit': res.x,
+                        'ssr': ssr
+                    })
+
+            if store_result:
+                results = pd.DataFrame(results)
+                return results
+            else:
+                return ssr_total
+        
         from scipy.optimize import minimize, LinearConstraint, Bounds
-        bounds = [[0, 1] for i in range(nfrac)]
-        c1 = LinearConstraint(np.ones(nfrac), lb=1, ub=1)
         res = minimize(
-            fun_min,
-            x0=np.ones(nfrac) / nfrac,
-            bounds=bounds,
-            constraints=[c1],
+            _deconv,
+            x0=np.ones(nmark),
+            args=(ncall,),
+            bounds=[[0, np.inf] for i in range(nmark)],
+            options={'maxiter': 1000},
+            method='Nelder-Mead',
         )
-        return res
+        weights = res.x
+        res_noweights = _deconv(np.ones(nmark), store_result=True)
+        res = _deconv(weights, store_result=True)
 
-    if False:
-        print('Test against artificial compositions of averages (this must work)')
-        results = []
-        for i in range(100):
-            if (i % 10) == 0:
-                print(i)
-            mix = simulate_mix(adata)
-            out = deconvolve(adata, mix)
-            residual = mix['fractions'] - out.x
-            ssr = (residual**2).sum()
-            results.append({
-                'fractions': mix['fractions'],
-                'fit': out.x,
-                'ssr': ssr
-            })
-            #print(f'Sum of squared residuals: {ssr}')
-        print('Done')
-        results = pd.DataFrame(results)
-        print('It works really well - of course')
-
+        return {
+            'genes': marker_ser.index,
+            'weights': weights,
+            'res_noweights': res_noweights,
+            'res_final': res,
+        }
 
     print('Test against single cells from the same dataset')
     sys.path.insert(0, str(path_fdn.parent / 'compressed_atlas' / 'prototype2' / 'cell_atlas_approximations_compression' / 'compression'))
@@ -124,7 +154,7 @@ if __name__ == '__main__':
             'nsubsample': n,
         }
 
-    nreps = 100
+    nreps = 10
     measurement_type = 'gene_expression'
     config_mt = load_config(species)[measurement_type]
     load_params = {}
@@ -162,39 +192,33 @@ if __name__ == '__main__':
             subannotation_kwargs=config_mt['cell_annotations']['subannotation_kwargs'],
         )
 
-        print('Begin test...')
-        results = []
+        print('Prepare mixes')
+        mixes = []
         for i in range(nreps):
             mix = simulate_mix_single_cell(adata_tissue)
-            out = deconvolve(adata, mix)
-            residual = mix['fractions'] - out.x
-            ssr = (residual**2).sum()
-            results.append({
-                'fractions': mix['fractions'],
-                'fit': out.x,
-                'ssr': ssr
-            })
-        print('Done')
-        results = pd.DataFrame(results)
+            mixes.append(mix)
 
-        fig, ax = plt.subplots()
-        ax.violinplot(results['ssr'])
-        ax.grid(True)
-        ax.set_ylabel('SSR')
-        fig.tight_layout()
+        print('Optimize weights')
+        res = deconvolve_multiple(adata, mixes)
 
-        fig, ax = plt.subplots()
-        x = np.concatenate(results['fractions'])
-        y = np.concatenate(results['fit'])
-        ax.scatter(x, y, color='k', alpha=0.3)
-        sns.kdeplot(x=x, y=y, palette='Reds')
-        ax.set_xlabel('True fraction')
-        ax.set_ylabel('Fitted fraction')
-        ax.set_xlim(left=0)
-        ax.set_ylim(bottom=0)
-        x0 = np.linspace(0, 1, 100)
-        ax.plot(x0, x0, ls='--', color='tomato')
-        ax.grid(True)
+        fig, axs = plt.subplots(1, 2, figsize=(8, 4), sharex=True, sharey=True)
+        for ax, key in zip(axs, ['res_noweights', 'res_final']):
+            results = res[key]
+            ax.set_title(key)
+            x = np.concatenate(results['fractions'])
+            y = np.concatenate(results['fit'])
+            c = plt.cm.get_cmap('viridis')(np.linspace(0, 1, len(x)))
+            ax.scatter(x, y, alpha=0.8, c=c)
+            sns.kdeplot(x=x, y=y, palette='Reds', ax=ax)
+            ax.set_xlabel('True fraction')
+            ax.set_ylabel('Fitted fraction')
+            ax.set_xlim(left=0)
+            ax.set_ylim(bottom=0)
+            x0 = np.linspace(0, 1, 100)
+            ax.plot(x0, x0, ls='--', color='tomato')
+            ax.grid(True)
         fig.tight_layout()
 
         plt.ion(); plt.show()
+
+        break
